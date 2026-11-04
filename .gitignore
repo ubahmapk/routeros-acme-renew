@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+dist/
+*.egg-info/
 .claude/
 # Never commit real configuration, keys, or certificates.
 *.env
