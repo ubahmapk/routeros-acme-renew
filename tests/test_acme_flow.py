@@ -11,7 +11,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from conftest import HOST
 from routeros_acme_renew import acme_flow
+from routeros_acme_renew.config import Settings
 from routeros_acme_renew.errors import RenewError
+from routeros_acme_renew.state import State
 
 
 def order_with(*challs):
@@ -108,3 +110,30 @@ def test_account_key_is_created_once_and_reused(tmp_path):
 def test_account_network_signs_with_es256(tmp_path):
     net = acme_flow.build_network(acme_flow.load_or_create_account_key(tmp_path / "k"))
     assert net.alg is josepy.ES256
+
+
+def issue_with_directory_failure(monkeypatch, tmp_path, exc):
+    def fail(url, net):
+        raise exc
+
+    monkeypatch.setattr(acme_flow.client.ClientV2, "get_directory", staticmethod(fail))
+    state = State(tmp_path)
+    state.ensure()
+    settings = Settings(host=HOST, ssh_user="acme", email="me@example.com")
+    return acme_flow.issue(settings, state, "https://acme.test/directory", dns=None)
+
+
+def test_http_failures_inside_acme_become_renew_errors(monkeypatch, tmp_path):
+    # acme does its HTTP with `requests`; its errors subclass OSError, which is all this code relies on.
+    requests = pytest.importorskip("requests")
+    with pytest.raises(RenewError, match="ACME exchange failed"):
+        issue_with_directory_failure(monkeypatch, tmp_path, requests.exceptions.ConnectionError("no route"))
+
+
+def test_local_disk_errors_are_not_reported_as_acme_failures(monkeypatch, tmp_path):
+    state = State(tmp_path)
+    state.ensure()
+    state.account_key.write_bytes(b"not a key")
+    settings = Settings(host=HOST, ssh_user="acme", email="me@example.com")
+    with pytest.raises(ValueError):  # bad key file surfaces as itself, not as "ACME exchange failed"
+        acme_flow.issue(settings, state, "https://acme.test/directory", dns=None)

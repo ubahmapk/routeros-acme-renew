@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import josepy
-import requests
 from acme import challenges, client, crypto_util, errors, messages
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -104,13 +103,14 @@ def solve(acme: Any, orderr: Any, host: str, dns: DnsSolver, deadline: datetime.
 
 def issue(settings: Settings, state: State, directory_url: str, dns: Route53Dns) -> Issued:
     """Order a certificate for ``settings.host``. Returns the full chain and a new EC P-256 private key."""
+    account_key = load_or_create_account_key(state.account_key)  # local file errors are not ACME errors
     try:
-        net = build_network(load_or_create_account_key(state.account_key))
+        net = build_network(account_key)
         acme = client.ClientV2(client.ClientV2.get_directory(directory_url, net), net)
         register(acme, state, settings.email)
         key_pem = new_ec_key_pem()
         orderr = acme.new_order(crypto_util.make_csr(key_pem, [settings.host]))
         final = solve(acme, orderr, settings.host, dns, datetime.datetime.now() + ORDER_TIMEOUT)
-    except (errors.Error, requests.RequestException) as exc:
-        raise RenewError(f"ACME request failed: {exc}") from exc
+    except (errors.Error, OSError) as exc:  # the acme library's HTTP failures (from requests) subclass OSError
+        raise RenewError(f"ACME exchange failed: {exc}") from exc
     return Issued(final.fullchain_pem.encode(), key_pem)
