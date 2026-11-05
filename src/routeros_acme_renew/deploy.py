@@ -30,6 +30,19 @@ def parse_cert_names(terse: str, prefix: str) -> list[str]:
     return [n for n in NAME_RE.findall(terse) if n.startswith(prefix)]
 
 
+def preflight(router: RouterLike) -> str:
+    """Cheap, read-only proof that we can log in and see the www-ssl service.
+
+    Returns the name of the certificate www-ssl uses now (empty or "none" if it has none).
+    """
+    try:
+        return router.run(":put [/ip service get [find name=www-ssl] certificate]").strip()
+    except RenewError as exc:
+        raise RenewError(
+            f"cannot read the www-ssl service (is it present, and may this SSH user read it?): {exc}"
+        ) from exc
+
+
 def _remove_certs(router: RouterLike, name_prefix: str) -> None:
     listing = router.run(f'/certificate print terse where name~"^{name_prefix}"')
     for name in parse_cert_names(listing, name_prefix):
@@ -43,12 +56,12 @@ def deploy(
     key_pem: bytes,
     leaf: x509.Certificate,
     https_port: int,
-    fetch: Callable[[str, int], x509.Certificate] = served_cert,
+    fetch: Callable[[str, int, str | None], x509.Certificate] = served_cert,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     prefix = f"{settings.cert_prefix}-"
     base = f"{prefix}{arrow.utcnow().format('YYYYMMDD-HHmmss')}"
-    previous = router.run(":put [/ip service get [find name=www-ssl] certificate]").strip()
+    previous = preflight(router)
     switched = False
     try:
         router.put(f"{base}.crt", crt_pem)
@@ -57,7 +70,7 @@ def deploy(
         router.run(f'/certificate import file-name={base}.key passphrase=""')
         router.run(f"/ip service set [find name=www-ssl] certificate={base}.crt_0")
         switched = True
-        _wait_until_served(fetch, settings.host, https_port, fingerprint(leaf), sleep)
+        _wait_until_served(fetch, settings.host, https_port, settings.address, fingerprint(leaf), sleep)
     except Exception as exc:
         if switched:
             restore = previous or "none"
@@ -82,16 +95,17 @@ def deploy(
 
 
 def _wait_until_served(
-    fetch: Callable[[str, int], x509.Certificate],
+    fetch: Callable[[str, int, str | None], x509.Certificate],
     host: str,
     port: int,
+    address: str | None,
     want: str,
     sleep: Callable[[float], None],
 ) -> None:
     for _ in range(5):
         sleep(2)
         try:
-            if fingerprint(fetch(host, port)) == want:
+            if fingerprint(fetch(host, port, address)) == want:
                 return
         except (OSError, RenewError):
             continue

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import socket
+import ssl
 import stat
+import threading
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from pydantic import ValidationError
 
 from conftest import HOST, NOW, key_pem, make_cert
 from routeros_acme_renew import certs
 from routeros_acme_renew.config import Settings
+from routeros_acme_renew.errors import NoCertificateError
 from routeros_acme_renew.state import PendingStore, State, write_private
 
 
@@ -86,3 +91,109 @@ def test_pending_store_roundtrip(tmp_path):
     assert store.all() == [rec]
     store.remove(rec)
     assert store.all() == []
+
+
+@pytest.mark.parametrize("address", ["172.16.2.1", "fd00::1", "guard.lan.example.com"])
+def test_settings_accept_an_ip_or_fqdn_address(address):
+    assert Settings(host=HOST, ssh_user="acme", email="me@example.com", address=address).address == address
+
+
+@pytest.mark.parametrize("address", ["-oProxyCommand=x", "a b", "172.16.2", "rtr;ls"])
+def test_settings_reject_bad_addresses(address):
+    with pytest.raises(ValidationError):
+        Settings(host=HOST, ssh_user="acme", email="me@example.com", address=address)
+
+
+def test_target_is_the_address_when_given_else_the_host():
+    plain = Settings(host=HOST, ssh_user="acme", email="me@example.com")
+    pinned = Settings(host=HOST, ssh_user="acme", email="me@example.com", address="172.16.2.1")
+    assert plain.target == HOST
+    assert pinned.target == "172.16.2.1"
+
+
+def listening_socket() -> tuple[socket.socket, int]:
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    return srv, srv.getsockname()[1]
+
+
+def test_reachable_is_true_only_when_every_port_accepts():
+    srv, port = listening_socket()
+    try:
+        assert certs.reachable("127.0.0.1", [port]) is True
+    finally:
+        srv.close()
+    assert certs.reachable("127.0.0.1", [port]) is False
+
+
+def test_reachable_is_false_for_a_name_that_does_not_resolve():
+    assert certs.reachable("nonexistent.invalid", [443]) is False
+
+
+def serve_one_tls_client(tmp_path, cert, key) -> tuple[int, dict]:
+    """Start a one-shot local TLS server. Returns its port and a dict that records the SNI name it saw."""
+    cert_file, key_file = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(key_pem(key))
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert_file, key_file)
+    seen: dict = {}
+
+    def record_sni(sock, server_name, context) -> None:
+        seen["sni"] = server_name
+
+    ctx.sni_callback = record_sni
+    srv, port = listening_socket()
+
+    def accept() -> None:
+        conn, _ = srv.accept()
+        try:
+            ctx.wrap_socket(conn, server_side=True).close()
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return port, seen
+
+
+def test_served_cert_connects_to_the_address_and_sends_the_host_name_as_sni(tmp_path):
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = make_cert(key=key)
+    port, seen = serve_one_tls_client(tmp_path, cert, key)
+
+    got = certs.served_cert("router.example.com", port, address="127.0.0.1")
+
+    assert certs.fingerprint(got) == certs.fingerprint(cert)
+    assert seen["sni"] == "router.example.com"
+
+
+def test_served_cert_without_an_address_needs_the_name_to_resolve():
+    with pytest.raises(OSError):
+        certs.served_cert("nonexistent.invalid", 443)
+
+
+def test_a_failed_tls_handshake_means_the_router_serves_no_certificate():
+    srv, port = listening_socket()
+
+    def accept_and_hang_up() -> None:
+        conn, _ = srv.accept()
+        conn.close()
+        srv.close()
+
+    threading.Thread(target=accept_and_hang_up, daemon=True).start()
+
+    with pytest.raises(NoCertificateError):
+        certs.served_cert("router.example.com", port, address="127.0.0.1")
+
+
+def test_a_refused_connection_is_not_mistaken_for_no_certificate():
+    srv, port = listening_socket()
+    srv.close()
+
+    with pytest.raises(OSError) as info:
+        certs.served_cert("router.example.com", port, address="127.0.0.1")
+
+    assert not isinstance(info.value, NoCertificateError)

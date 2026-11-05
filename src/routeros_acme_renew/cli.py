@@ -3,9 +3,9 @@
 1. Skip quietly (exit 0) if the router is not reachable from here.
 2. Skip if the certificate the router is serving is a production Let's Encrypt
    certificate younger than --renew-days.
-3. Otherwise get a certificate (ACME DNS-01 via Route 53), upload and import it over
-   SSH/SFTP, point `www-ssl` at it, and check that the router now serves it. If it
-   does not, put the previous certificate back.
+3. Otherwise prove SSH login works, then get a certificate (ACME DNS-01 via Route 53),
+   upload and import it over SSH/SFTP, point `www-ssl` at it, and check that the router
+   now serves it. If it does not, put the previous certificate back.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ from pydantic import ValidationError
 from .acme_flow import LE_PRODUCTION, LE_STAGING
 from .certs import fingerprint, reachable, renewal_decision, served_cert
 from .config import Settings
-from .deploy import deploy
-from .errors import RenewError
+from .deploy import deploy, preflight
+from .errors import NoCertificateError, RenewError
 from .renew import obtain
 from .route53 import Route53Dns
 from .router import Router
@@ -43,7 +43,8 @@ def main(
     host: Annotated[str, typer.Option(envvar="ROUTER_HOST", help="FQDN of the router, e.g. router.example.com.")],
     ssh_user: Annotated[str, typer.Option(envvar="ROUTER_SSH_USER", help="RouterOS user for SSH (key auth).")],
     email: Annotated[str, typer.Option(envvar="ACME_EMAIL", help="Contact address registered with the ACME CA.")],
-    ssh_key: Annotated[Path | None, typer.Option(envvar="ROUTER_SSH_KEY", help="SSH key file; default is ssh-agent or ~/.ssh.")] = None,
+    address: Annotated[str | None, typer.Option(envvar="ROUTER_ADDRESS", help="IP or name to connect to when --host does not resolve here. --host stays the certificate name.")] = None,
+    ssh_key: Annotated[Path | None, typer.Option(envvar="ROUTER_SSH_KEY", help="SSH key to use. A public key file picks that key from your ssh-agent; a private key file is used directly. Default: every agent key in turn, which RouterOS drops after the first rejected one.")] = None,
     zone_id: Annotated[str | None, typer.Option(envvar="AWS_HOSTED_ZONE_ID", help="Route 53 hosted zone ID; default is auto-detect.")] = None,
     renew_days: Annotated[int, typer.Option(min=1, max=89, help="Renew when the served cert is this old.")] = 60,
     https_port: Annotated[int, typer.Option(help="Port www-ssl listens on.")] = 443,
@@ -59,30 +60,43 @@ def main(
     logging.getLogger("paramiko").setLevel(logging.WARNING)
 
     try:
-        settings = Settings(host=host, ssh_user=ssh_user, email=email)
+        settings = Settings(host=host, ssh_user=ssh_user, email=email, address=address)
     except ValidationError as exc:
         raise _fail(f"Invalid settings:\n{exc}") from exc
+    label = f"{settings.host} ({settings.address})" if settings.address else settings.host
 
     # 1. Can we reach the router from wherever we are right now?
-    if not reachable(settings.host, [https_port, ssh_port]):
-        typer.echo(f"{settings.host} is not reachable from here; skipping certificate check.")
+    if not reachable(settings.target, [https_port, ssh_port]):
+        typer.echo(f"{label} is not reachable from here; skipping certificate check.")
         raise typer.Exit(0)
 
     # 2. How old is the certificate it is serving?
+    current = None
     try:
-        current = served_cert(settings.host, https_port)
+        current = served_cert(settings.host, https_port, settings.address)
+    except NoCertificateError:
+        renew, reason = True, "the router is not serving a certificate yet"
     except (OSError, RenewError) as exc:
-        raise _fail(f"Could not read the certificate from {settings.host}:{https_port}: {exc}") from exc
-    renew, reason = renewal_decision(current, renew_days, force)
+        raise _fail(f"Could not read the certificate from {settings.target}:{https_port}: {exc}") from exc
+    else:
+        renew, reason = renewal_decision(current, renew_days, force)
     if not renew:
-        typer.echo(f"{settings.host}: certificate OK, {reason}.")
+        typer.echo(f"{label}: certificate OK, {reason}.")
         raise typer.Exit(0)
-    typer.echo(f"{settings.host}: renewing, {reason}.")
+    typer.echo(f"{label}: renewing, {reason}.")
+
+    # 3. Prove SSH login works before spending a certificate order. A wrong network, an untrusted host key
+    #    or a missing permission fails here, not after the CA has issued something.
+    try:
+        with Router(settings.target, ssh_port, settings.ssh_user, ssh_key) as router:
+            preflight(router)
+    except RenewError as exc:
+        raise _fail(f"Router check failed: {exc}") from exc
     if dry_run:
-        typer.echo("Dry run: nothing changed.")
+        typer.echo("Dry run: the router is reachable and SSH login works. Nothing was changed.")
         raise typer.Exit(0)
 
-    # 3. Renew and replace.
+    # 4. Renew and replace.
     session = boto3.Session()
     if session.get_credentials() is None:
         raise _fail(
@@ -98,14 +112,19 @@ def main(
     try:
         dns.sweep()
         crt_pem, key_pem, leaf = obtain(
-            settings, state, LE_STAGING if staging else LE_PRODUCTION, dns, renew_days, fingerprint(current)
+            settings,
+            state,
+            LE_STAGING if staging else LE_PRODUCTION,
+            dns,
+            renew_days,
+            fingerprint(current) if current else "",
         )
-        with Router(settings.host, ssh_port, settings.ssh_user, ssh_key) as router:
+        with Router(settings.target, ssh_port, settings.ssh_user, ssh_key) as router:
             deploy(router, settings, crt_pem, key_pem, leaf, https_port)
     except RenewError as exc:
         raise _fail(f"Renewal failed: {exc}") from exc
     typer.secho(
-        f"{settings.host}: new certificate installed (expires {arrow.get(leaf.not_valid_after_utc).humanize()}).",
+        f"{label}: new certificate installed (expires {arrow.get(leaf.not_valid_after_utc).humanize()}).",
         fg=typer.colors.GREEN,
     )
 
