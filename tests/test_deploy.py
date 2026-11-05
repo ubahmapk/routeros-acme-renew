@@ -6,7 +6,7 @@ import pytest
 
 from conftest import HOST, make_cert
 from routeros_acme_renew.config import Settings
-from routeros_acme_renew.deploy import deploy, parse_cert_names
+from routeros_acme_renew.deploy import deploy, parse_cert_names, preflight
 from routeros_acme_renew.errors import RenewError
 
 OLD = "acme-20250101-000000.crt_0"
@@ -45,7 +45,7 @@ def settings():
 
 def run_deploy(router, settings, served):
     leaf = make_cert()
-    deploy(router, settings, b"CRT", b"KEY", leaf, 443, fetch=lambda h, p: served(leaf), sleep=lambda s: None)
+    deploy(router, settings, b"CRT", b"KEY", leaf, 443, fetch=lambda h, p, a: served(leaf), sleep=lambda s: None)
 
 
 def test_parse_cert_names_ignores_the_common_name_field():
@@ -98,3 +98,29 @@ def test_failed_import_leaves_the_service_alone_and_cleans_up(settings):
     assert not any("/ip service set" in c for c in router.commands)
     assert any(c.startswith("/certificate remove") for c in router.commands)
     assert any(c.startswith("/file remove") for c in router.commands)
+
+
+def test_preflight_returns_the_certificate_www_ssl_uses_now():
+    router = FakeRouter()
+
+    assert preflight(router) == "old-service-cert"
+    assert router.commands == [":put [/ip service get [find name=www-ssl] certificate]"]
+
+
+def test_preflight_explains_an_unreadable_service():
+    with pytest.raises(RenewError, match="cannot read the www-ssl service"):
+        preflight(FakeRouter(fail_on=":put"))
+
+
+def test_verification_connects_to_the_address_but_keeps_the_host_name():
+    settings = Settings(host=HOST, ssh_user="acme", email="me@example.com", address="172.16.2.1")
+    leaf = make_cert()
+    seen = []
+
+    def fetch(host, port, address):
+        seen.append((host, port, address))
+        return leaf
+
+    deploy(FakeRouter(), settings, b"CRT", b"KEY", leaf, 443, fetch=fetch, sleep=lambda s: None)
+
+    assert seen[0] == (HOST, 443, "172.16.2.1")

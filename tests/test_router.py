@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 
 import paramiko
@@ -120,6 +121,104 @@ def test_put_failure_is_a_renew_error(monkeypatch):
     router, _ = make_router(monkeypatch, fail_sftp=True)
     with pytest.raises(RenewError, match="upload of acme-1.crt failed"):
         router.put("acme-1.crt", b"PEM")
+
+
+def test_connects_to_the_target_it_was_given(monkeypatch):
+    router, fake = make_router(monkeypatch)
+    with router:
+        pass
+    assert fake.connected_with["host"] == "router.example.com"
+
+
+def test_connects_to_an_ip_target_so_known_hosts_is_checked_under_that_ip(monkeypatch):
+    _, fake = make_router(monkeypatch)
+    with router_mod.Router("172.16.2.1", 22, "acme"):
+        pass
+    assert fake.connected_with["host"] == "172.16.2.1"
+
+
+class FakeAgentKey:
+    def __init__(self, blob: bytes) -> None:
+        self._blob = blob
+
+    def asbytes(self) -> bytes:
+        return self._blob
+
+
+def fake_agent(monkeypatch, *blobs: bytes) -> list[FakeAgentKey]:
+    keys = [FakeAgentKey(b) for b in blobs]
+
+    class Agent:
+        def get_keys(self):
+            return keys
+
+    monkeypatch.setattr(router_mod.paramiko, "Agent", Agent)
+    return keys
+
+
+def public_key_file(tmp_path, blob: bytes, name="guard.pub"):
+    path = tmp_path / name
+    path.write_text(f"ssh-ed25519 {base64.b64encode(blob).decode()} 1P Ed25519 SSH Key\n")
+    return path
+
+
+def test_without_a_key_every_agent_key_and_key_file_is_tried(monkeypatch):
+    router, fake = make_router(monkeypatch)
+    with router:
+        pass
+    assert fake.connected_with["allow_agent"] is True
+    assert fake.connected_with["look_for_keys"] is True
+    assert "pkey" not in fake.connected_with
+
+
+def test_a_public_key_file_selects_exactly_that_agent_key(monkeypatch, tmp_path):
+    keys = fake_agent(monkeypatch, b"other-key", b"the-right-key", b"third-key")
+    _, fake = make_router(monkeypatch)
+    pub = public_key_file(tmp_path, b"the-right-key")
+
+    with router_mod.Router("172.16.2.1", 22, "acme", key_file=pub):
+        pass
+
+    assert fake.connected_with["pkey"] is keys[1]
+    assert fake.connected_with["allow_agent"] is False  # offering other keys is what makes RouterOS hang up
+    assert fake.connected_with["look_for_keys"] is False
+
+
+def test_a_public_key_file_that_is_not_in_the_agent_is_a_clear_error(monkeypatch, tmp_path):
+    fake_agent(monkeypatch, b"other-key")
+    make_router(monkeypatch)
+    pub = public_key_file(tmp_path, b"missing-key")
+
+    with (
+        pytest.raises(RenewError, match="no key in the ssh-agent matches"),
+        router_mod.Router("172.16.2.1", 22, "acme", key_file=pub),
+    ):
+        pass
+
+
+def test_a_private_key_file_is_used_directly_and_alone(monkeypatch, tmp_path):
+    _, fake = make_router(monkeypatch)
+    # Anything that is not an OpenSSH public key line is treated as a private key file; the content is irrelevant here.
+    private = tmp_path / "id_ed25519"
+    private.write_text("opaque private key file contents\n")
+
+    with router_mod.Router("172.16.2.1", 22, "acme", key_file=private):
+        pass
+
+    assert fake.connected_with["key_filename"] == str(private)
+    assert fake.connected_with["allow_agent"] is False
+    assert "pkey" not in fake.connected_with
+
+
+def test_a_dropped_connection_during_auth_explains_how_to_name_the_key(monkeypatch):
+    router, fake = make_router(monkeypatch)
+
+    def dropped(host, **kwargs):
+        raise paramiko.SSHException("No existing session")
+
+    fake.connect = dropped
+    with pytest.raises(RenewError, match="--ssh-key"), router:
+        pass
 
 
 def test_connect_failure_hints_at_known_hosts(monkeypatch):

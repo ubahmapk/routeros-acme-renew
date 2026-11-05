@@ -10,7 +10,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID
 
-from .errors import RenewError
+from .errors import NoCertificateError
 
 
 def load_leaf(pem: bytes) -> x509.Certificate:
@@ -64,27 +64,35 @@ def covers_host(cert: x509.Certificate, host: str) -> bool:
     return host.lower() in {n.lower() for n in san.get_values_for_type(x509.DNSName)}
 
 
-def reachable(host: str, ports: list[int], timeout: float = 3.0) -> bool:
-    """True only if the name resolves and every port accepts a TCP connection."""
+def reachable(target: str, ports: list[int], timeout: float = 3.0) -> bool:
+    """True only if the name or address resolves and every port accepts a TCP connection."""
     for port in ports:
         try:
-            with socket.create_connection((host, port), timeout=timeout):
+            with socket.create_connection((target, port), timeout=timeout):
                 pass
         except OSError:
             return False
     return True
 
 
-def served_cert(host: str, port: int, timeout: float = 5.0) -> x509.Certificate:
-    """Fetch whatever certificate the host serves, without trusting it."""
+def served_cert(host: str, port: int, address: str | None = None, timeout: float = 5.0) -> x509.Certificate:
+    """Fetch whatever certificate is served for ``host``, without trusting it.
+
+    Connects to ``address`` when given (``host`` may not resolve from here); ``host`` is still sent as the TLS
+    server name, so a router that picks its certificate by name serves the right one.
+    """
+    target = address or host
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with (
-        socket.create_connection((host, port), timeout=timeout) as raw,
-        ctx.wrap_socket(raw, server_hostname=host) as tls,
-    ):
-        der = tls.getpeercert(binary_form=True)
+    try:
+        with (
+            socket.create_connection((target, port), timeout=timeout) as raw,
+            ctx.wrap_socket(raw, server_hostname=host) as tls,
+        ):
+            der = tls.getpeercert(binary_form=True)
+    except ssl.SSLError as exc:  # a refused handshake; timeouts and refused connections stay plain OSErrors
+        raise NoCertificateError(f"{target}:{port} presented no certificate ({exc.reason or exc})") from exc
     if not der:
-        raise RenewError(f"{host}:{port} did not present a certificate")
+        raise NoCertificateError(f"{target}:{port} did not present a certificate")
     return x509.load_der_x509_certificate(der)
