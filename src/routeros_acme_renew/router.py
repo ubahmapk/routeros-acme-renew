@@ -54,8 +54,19 @@ class Router:
     under that same string, so it must already be trusted there. ~/.ssh/config is not read.
     """
 
-    def __init__(self, target: str, port: int, user: str, key_file: Path | None = None, timeout: float = 5.0) -> None:
-        self.target, self.port, self.user, self.key_file, self.timeout = target, port, user, key_file, timeout
+    def __init__(
+        self,
+        target: str,
+        port: int,
+        user: str,
+        key_file: Path | None = None,
+        timeout: float = 5.0,
+        auth_timeout: float = 60.0,
+    ) -> None:
+        # `timeout` covers the TCP connect and SSH banner. `auth_timeout` is longer on purpose: with the 1Password
+        # ssh-agent, signing waits for a person to approve the request.
+        self.target, self.port, self.user, self.key_file = target, port, user, key_file
+        self.timeout, self.auth_timeout = timeout, auth_timeout
         self._client = paramiko.SSHClient()
         self._client.load_system_host_keys()
         self._client.set_missing_host_key_policy(paramiko.RejectPolicy())
@@ -83,14 +94,18 @@ class Router:
                 username=self.user,
                 timeout=self.timeout,
                 banner_timeout=self.timeout,
-                auth_timeout=self.timeout,
+                auth_timeout=self.auth_timeout,
                 **self._auth_options(),
             )
         except (paramiko.SSHException, OSError) as exc:
-            hint = ""
-            if "known_hosts" in str(exc):
+            text, hint = str(exc), ""
+            if "known_hosts" in text:
                 hint = f" (trust the host key first: ssh {self.user}@{self.target})"
-            elif "No existing session" in str(exc) or isinstance(exc, paramiko.AuthenticationException):
+            elif "Authentication timeout" in text:
+                hint = (
+                    " (no reply to the signing request; if 1Password asked to approve the SSH key, approve it sooner)"
+                )
+            elif "No existing session" in text or isinstance(exc, paramiko.AuthenticationException):
                 hint = " (the router rejected the key; name the right one with --ssh-key, a public key file for an agent key)"
             raise RenewError(f"could not connect to {self.target}:{self.port} over SSH: {exc}{hint}") from exc
         return self

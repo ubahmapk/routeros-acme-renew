@@ -18,6 +18,13 @@ from .errors import RenewError
 log = logging.getLogger(__name__)
 
 NAME_RE = re.compile(r"(?:^|\s)name=(\S+)")
+# `/certificate print terse` lines look like " 0 KLT name=... ": an index, the flags (K = has a private key), then fields.
+KEY_FLAG_RE = re.compile(r"^\s*\d+\s+([A-Za-z ]*?)\s*name=", re.MULTILINE)
+# The service's allowed source ranges: `available-from` on current RouterOS, `address` on older versions.
+SOURCES_RE = re.compile(r"(?:available-from|address)=(\S+)")
+SERVICE_CERT_CMD = ":put [/ip service get [find name=www-ssl] certificate]"
+BIND_ATTEMPTS = 15
+VERIFY_ATTEMPTS = 5
 
 
 class RouterLike(Protocol):
@@ -36,7 +43,7 @@ def preflight(router: RouterLike) -> str:
     Returns the name of the certificate www-ssl uses now (empty or "none" if it has none).
     """
     try:
-        return router.run(":put [/ip service get [find name=www-ssl] certificate]").strip()
+        return router.run(SERVICE_CERT_CMD).strip()
     except RenewError as exc:
         raise RenewError(
             f"cannot read the www-ssl service (is it present, and may this SSH user read it?): {exc}"
@@ -68,9 +75,19 @@ def deploy(
         router.put(f"{base}.key", key_pem)
         router.run(f'/certificate import file-name={base}.crt passphrase=""')
         router.run(f'/certificate import file-name={base}.key passphrase=""')
-        router.run(f"/ip service set [find name=www-ssl] certificate={base}.crt_0")
-        switched = True
-        _wait_until_served(fetch, settings.host, https_port, settings.address, fingerprint(leaf), sleep)
+        leaf_name = f"{base}.crt_0"
+        _wait_for_private_key(router, leaf_name, sleep)
+        switched = True  # from here the service may point at the new certificate, so a failure rolls it back
+        _bind_service(router, leaf_name, sleep)
+        try:
+            _wait_until_served(fetch, settings.host, https_port, settings.address, fingerprint(leaf), sleep)
+        except RenewError as exc:
+            sources = _allowed_sources(router)
+            if sources:
+                raise RenewError(
+                    f"{exc}. www-ssl only accepts connections from {sources}; is this machine's address in that list?"
+                ) from exc
+            raise
     except Exception as exc:
         if switched:
             restore = previous or "none"
@@ -94,6 +111,46 @@ def deploy(
             router.run(f'/certificate remove [find name="{name}"]')
 
 
+def _wait_for_private_key(router: RouterLike, name: str, sleep: Callable[[float], None], attempts: int = 10) -> None:
+    """Wait until the router reports ``name`` with its private key (the K flag).
+
+    Also turns a key import that silently did nothing into a clear error.
+    """
+    for _ in range(attempts):
+        match = KEY_FLAG_RE.search(router.run(f'/certificate print terse where name="{name}"'))
+        if match and "K" in match.group(1):
+            return
+        sleep(1)
+    raise RenewError(f"the router has {name} but no private key for it (did the key import fail?)")
+
+
+def _bind_service(router: RouterLike, name: str, sleep: Callable[[float], None], attempts: int = BIND_ATTEMPTS) -> None:
+    """Point www-ssl at certificate ``name`` and confirm by reading the setting back.
+
+    Right after an import RouterOS can reject the `set` ("input does not match any value of certificate") because the
+    certificate is not yet a valid choice. That error appears only in the router's log: the SSH command still looks
+    successful. So a successful-looking `set` proves nothing; keep trying until the router reports the new value.
+    """
+    for _ in range(attempts):
+        router.run(f"/ip service set [find name=www-ssl] certificate={name}")
+        if router.run(SERVICE_CERT_CMD).strip() == name:
+            return
+        sleep(1)
+    raise RenewError(
+        f"the router would not accept {name} as the www-ssl certificate "
+        "(its log says 'input does not match any value of certificate' when it refuses)"
+    )
+
+
+def _allowed_sources(router: RouterLike) -> str | None:
+    """The source ranges www-ssl accepts, or None if there is no restriction or it cannot be read."""
+    try:
+        match = SOURCES_RE.search(router.run("/ip service print terse where name=www-ssl"))
+    except RenewError:
+        return None
+    return match.group(1) if match else None
+
+
 def _wait_until_served(
     fetch: Callable[[str, int, str | None], x509.Certificate],
     host: str,
@@ -102,14 +159,18 @@ def _wait_until_served(
     want: str,
     sleep: Callable[[float], None],
 ) -> None:
-    for _ in range(5):
+    """Wait for the router to serve the certificate with fingerprint ``want``, reporting the last thing it did."""
+    last = "no check ran"
+    for _ in range(VERIFY_ATTEMPTS):
         sleep(2)
         try:
-            if fingerprint(fetch(host, port, address)) == want:
+            served = fingerprint(fetch(host, port, address))
+            if served == want:
                 return
-        except (OSError, RenewError):
-            continue
-    raise RenewError("router is not serving the new certificate after the switch")
+            last = f"the router serves another certificate (sha256 {served[:12]}, expected {want[:12]})"
+        except (OSError, RenewError) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+    raise RenewError(f"router is not serving the new certificate after the switch (last check: {last})")
 
 
 def _best_effort(action: Callable[[], object]) -> None:
