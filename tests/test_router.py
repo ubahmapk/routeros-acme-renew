@@ -210,6 +210,26 @@ def test_a_private_key_file_is_used_directly_and_alone(monkeypatch, tmp_path):
     assert "pkey" not in fake.connected_with
 
 
+def test_authentication_gets_a_longer_timeout_than_the_connection_so_a_person_can_approve(monkeypatch):
+    router, fake = make_router(monkeypatch)
+    with router:
+        pass
+    assert fake.connected_with["timeout"] == 5.0
+    assert fake.connected_with["auth_timeout"] == 60.0
+
+
+def test_an_authentication_timeout_is_not_blamed_on_the_router_rejecting_the_key(monkeypatch):
+    router, fake = make_router(monkeypatch)
+
+    def slow(host, **kwargs):
+        raise paramiko.AuthenticationException("Authentication timeout.")
+
+    fake.connect = slow
+    with pytest.raises(RenewError, match="approve it sooner") as info, router:
+        pass
+    assert "rejected the key" not in str(info.value)
+
+
 def test_a_dropped_connection_during_auth_explains_how_to_name_the_key(monkeypatch):
     router, fake = make_router(monkeypatch)
 
